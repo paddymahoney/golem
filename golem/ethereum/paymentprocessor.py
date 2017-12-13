@@ -1,8 +1,12 @@
+import abc
 import json
 import logging
 import sys
 import time
+from collections import deque
+from threading import Lock
 from time import sleep
+from typing import Any, List
 
 from ethereum import abi, utils, keys
 from ethereum.transactions import Transaction
@@ -18,10 +22,8 @@ from .node import tETH_faucet_donate
 
 log = logging.getLogger("golem.pay")
 
-gnt_contract = abi.ContractTranslator(json.loads(TestGNT.ABI))
 
-
-def _encode_payments(payments):
+def encode_payments(payments: List[Payment]):
     paymap = {}
     for p in payments:
         if p.payee in paymap:
@@ -42,7 +44,136 @@ def _encode_payments(payments):
             raise ValueError(
                 "Incorrect pair length: {}. Should be 32".format(len(pair)))
         args.append(pair)
-    return args, value
+    return args
+
+
+class AbstractToken(object, metaclass=abc.ABCMeta):
+    """
+    This is a common interface for token transactions for the process of
+    switching between GNT and GNTW. Add awaiting payments using
+    put_awaiting_payments. Grab the next ready batch using take_next_batch and
+    make a transaction for it. This way it is possible to hold on with a batch
+    until some preprocessing has been made to make sending that batch possible.
+    """
+    def __init__(self, client: Client, privkey: bytes):
+        self._client = client
+        self._privkey = privkey
+        self._eth_address = '0x' + encode_hex(keys.privtoaddr(privkey))
+
+    def _create_transaction(self, token_address, data, gas: int) -> Transaction:
+        nonce = self._client.get_transaction_count(self._eth_address)
+        tx = Transaction(nonce,
+                         PaymentProcessor.GAS_PRICE,
+                         gas,
+                         to=token_address,
+                         value=0,
+                         data=data)
+        tx.sign(self._privkey)
+        return tx
+
+    def _send_transaction(self, token_address, data, gas: int) -> Transaction:
+        tx = self._create_transaction(token_address, data, gas)
+        self._client.send(tx)
+        return tx
+
+    def _get_balance(self, abi, token_address) -> int:
+        addr = keys.privtoaddr(self._privkey)
+        data = abi.encode_function_call('balanceOf', [addr])
+        r = self._client.call(
+            _from='0x' + encode_hex(addr),
+            to='0x' + encode_hex(token_address),
+            data='0x' + encode_hex(data),
+            block='pending')
+        if r is None:
+            return None
+        return 0 if r == '0x' else int(r, 16)
+
+    def _request_from_faucet(self, abi, token_address) -> None:
+        data = abi.encode_function_call('create', [])
+        self._send_transaction(token_address, data, 90000)
+
+    @abc.abstractmethod
+    def put_awaiting_payments(self, batch) -> None:
+        pass
+
+    @abc.abstractmethod
+    def has_awaiting(self) -> bool:
+        pass
+
+    @abc.abstractmethod
+    def take_next_batch(self) -> (List[Payment], Transaction):
+        pass
+
+    @abc.abstractmethod
+    def get_incomes_from_block(self, block: int, address) -> List[Any]:
+        pass
+
+
+class GNTToken(AbstractToken):
+    """
+    When the main token and the batchTransfer function are in the same contract.
+    Which is the case for tGNT in testnet and eventually (after migration)
+     will be the case for the new GNT in the mainnet as well.
+    """
+    TESTGNT_ADDR = decode_hex("7295bB8709EC1C22b758A8119A4214fFEd016323")
+
+    # keccak256(Transfer(address,address,uint256))
+    TRANSFER_EVENT_ID = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'  # noqa
+
+    def __init__(self, client: Client, privkey: bytes):
+        super().__init__(client, privkey)
+        self.__testGNT = abi.ContractTranslator(json.loads(TestGNT.ABI))
+        self.__payments = []  # type: List[Payment]
+
+    def get_balance(self) -> int:
+        balance = self._get_balance(self.__testGNT, self.TESTGNT_ADDR)
+        if balance is not None:
+            log.info("TestGNT: {}".format(balance / denoms.ether))
+        return balance
+
+    def request_from_faucet(self) -> None:
+        self._request_from_faucet(self.__testGNT, self.TESTGNT_ADDR)
+
+    def put_awaiting_payments(self, batch) -> None:
+        self.__payments.extend(batch)
+
+    def has_awaiting(self) -> bool:
+        return bool(self.__payments)
+
+    def take_next_batch(self) -> (List[Payment], Transaction):
+        if not self.__payments:
+            return None
+
+        payments = self.__payments
+        self.__payments = []
+
+        p = encode_payments(payments)
+        data = self.__testGNT.encode_function_call('batchTransfer', [p])
+        gas = PaymentProcessor.GAS_BATCH_PAYMENT_BASE + \
+            len(p) * PaymentProcessor.GAS_PER_PAYMENT
+        tx = self._create_transaction(self.TESTGNT_ADDR, data, gas)
+
+        return payments, tx
+
+    def get_incomes_from_block(self, block: int, address) -> List[Any]:
+        logs = self._client.get_logs(block,
+                                     block,
+                                     '0x' + encode_hex(self.TESTGNT_ADDR),
+                                     [self.TRANSFER_EVENT_ID, None, address])
+        if not logs:
+            return logs
+
+        res = []
+        for entry in logs:
+            if entry['topics'][2] != address:
+                raise Exception("Unexpected income event from {}"
+                                .format(entry['topics'][2]))
+
+            res.append({
+                'sender': entry['topics'][1],
+                'value': int(entry['data'], 16),
+            })
+        return res
 
 
 class PaymentProcessor(LoopingCallService):
@@ -62,17 +193,17 @@ class PaymentProcessor(LoopingCallService):
     # Time required to reset the current balance when errors occur
     BALANCE_RESET_TIMEOUT = 30
 
-    TESTGNT_ADDR = decode_hex("7295bB8709EC1C22b758A8119A4214fFEd016323")
-
     SYNC_CHECK_INTERVAL = 10
 
     # Minimal number of confirmations before we treat transactions as done
     REQUIRED_CONFIRMATIONS = 12
 
-    # keccak256(Transfer(address,address,uint256))
-    LOG_ID = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'  # noqa
-
-    def __init__(self, client: Client, privkey, faucet=False) -> None:
+    def __init__(self,
+                 client: Client,
+                 privkey,
+                 faucet=False,
+                 token_factory=GNTToken) -> None:
+        self.__token = token_factory(client, privkey)
         self.__client = client
         self.__privkey = privkey
         self.__eth_balance = None
@@ -81,13 +212,13 @@ class PaymentProcessor(LoopingCallService):
         self.__gnt_reserved = 0
         self.__eth_update_ts = 0
         self.__gnt_update_ts = 0
+        self._awaiting_lock = Lock()
         self._awaiting = []  # type: List[Any] # Awaiting individual payments
         self._inprogress = {}  # type: Dict[Any,Any] # Sent transactions.
         self.__last_sync_check = time.time()
         self.__sync = False
         self.__temp_sync = False
         self.__faucet = faucet
-        self.__testGNT = abi.ContractTranslator(json.loads(TestGNT.ABI))
         self._waiting_for_faucet = False
         self.deadline = sys.maxsize
         self.load_from_db()
@@ -110,7 +241,6 @@ class PaymentProcessor(LoopingCallService):
 
     def is_synchronized(self):
         """ Checks if the Ethereum node is in sync with the network."""
-
         if time.time() - self.__last_sync_check <= self.SYNC_CHECK_INTERVAL:
             # When checking again within 10 s return previous status.
             # This also handles geth issue where synchronization starts after
@@ -174,19 +304,8 @@ class PaymentProcessor(LoopingCallService):
 
     def gnt_balance(self, refresh=False):
         if self.__gnt_balance is None or refresh:
-            addr = keys.privtoaddr(self.__privkey)
-            data = self.__testGNT.encode('balanceOf', (addr,))
-            r = self.__client.call(_from='0x' + encode_hex(addr),
-                                   to='0x' + encode_hex(self.TESTGNT_ADDR),
-                                   data='0x' + encode_hex(data),
-                                   block='pending')
-            if r is None:
-                gnt_balance = None
-            else:
-                gnt_balance = 0 if r == '0x' else int(r, 16)
-
+            gnt_balance = self.__token.get_balance()
             self._update_gnt_balance(gnt_balance)
-            log.info("GNT: {}".format(self.__gnt_balance / denoms.ether))
         return self.__gnt_balance
 
     def _update_eth_balance(self, eth_balance):
@@ -259,43 +378,46 @@ class PaymentProcessor(LoopingCallService):
             log.warning("Low GNT: {:.6f}".format(av_gnt / denoms.ether))
             return False
 
-        self._awaiting.append(payment)
+        with self._awaiting_lock:
+            self._awaiting.append(payment)
+            # TODO: Optimize by checking the time once per service update.
+            new_deadline = int(time.time()) + deadline
+            if new_deadline < self.deadline:
+                self.deadline = new_deadline
+
         self.__gnt_reserved += payment.value
         self.__eth_reserved += self.ETH_PER_PAYMENT
-
-        # Set new deadline if not set already or shorter than the current one.
-        # TODO: Optimize by checking the time once per service update.
-        new_deadline = int(time.time()) + deadline
-        if new_deadline < self.deadline:
-            self.deadline = new_deadline
 
         log.info("GNT: available {:.6f}, reserved {:.6f}".format(
             av_gnt / denoms.ether, self.__gnt_reserved / denoms.ether))
         return True
 
     def sendout(self):
-        if not self._awaiting:
-            return False
+        with self._awaiting_lock:
+            if self._awaiting:
+                self.__token.put_awaiting_payments(self._awaiting)
+                self._awaiting = []
 
-        now = int(time.time())
-        if self.deadline > now:
-            log.info("Next sendout in {} s".format(self.deadline - now))
-            return False
+            now = int(time.time())
+            if self.deadline > now and self.__token.has_awaiting():
+                log.info("Next sendout in {} s".format(self.deadline - now))
+                return False
 
-        payments = self._awaiting  # FIXME: Should this list be synchronized?
-        self._awaiting = []
-        self.deadline = sys.maxsize
-        addr = self.eth_address(zpad=False)
-        nonce = self.__client.get_transaction_count(addr)
-        p, value = _encode_payments(payments)
-        data = gnt_contract.encode('batchTransfer', [p])
-        gas = self.GAS_BATCH_PAYMENT_BASE + len(p) * self.GAS_PER_PAYMENT
-        tx = Transaction(nonce, self.GAS_PRICE, gas, to=self.TESTGNT_ADDR,
-                         value=0, data=data)
-        tx.sign(self.__privkey)
+        batch = self.__token.take_next_batch()
+        if not batch:
+            return False
+        payments, tx = batch
+        value = sum([p.value for p in payments])
         h = tx.hash
         log.info("Batch payments: {:.6}, value: {:.6f}"
                  .format(encode_hex(h), value / denoms.ether))
+
+        # If awaiting payments are not empty it means a new payment has been
+        # added between clearing the awaiting list and here. In that case
+        # we shouldn't update the deadline to sys.maxsize.
+        with self._awaiting_lock:
+            if not self._awaiting:
+                self.deadline = sys.maxsize
 
         # Firstly write transaction hash to database. We need the hash to be
         # remembered before sending the transaction to the Ethereum node in
@@ -408,36 +530,13 @@ class PaymentProcessor(LoopingCallService):
 
     def get_gnt_from_faucet(self):
         if self.__faucet and self.gnt_balance(True) < 100 * denoms.ether:
-            log.info("Requesting tGNT")
-            addr = self.eth_address(zpad=False)
-            nonce = self.__client.get_transaction_count(addr)
-            data = self.__testGNT.encode_function_call('create', ())
-            tx = Transaction(nonce, self.GAS_PRICE, 90000, to=self.TESTGNT_ADDR,
-                             value=0, data=data)
-            tx.sign(self.__privkey)
-            self.__client.send(tx)
+            log.info("Requesting GNT from faucet")
+            self.__token.request_from_faucet()
             return False
         return True
 
     def get_incomes_from_block(self, block, address):
-        logs = self.get_logs(block,
-                             block,
-                             '0x' + encode_hex(self.TESTGNT_ADDR),
-                             [self.LOG_ID, None, address])
-        if not logs:
-            return logs
-
-        res = []
-        for entry in logs:
-            if entry['topics'][2] != address:
-                raise Exception("Unexpected income event from {}"
-                    .format(entry['topics'][2]))
-
-            res.append({
-                'sender': entry['topics'][1],
-                'value': int(entry['data'], 16),
-            })
-        return res
+        return self.__token.get_incomes_from_block(block, address)
 
     def get_logs(self,
                  from_block=None,

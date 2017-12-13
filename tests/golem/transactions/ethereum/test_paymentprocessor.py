@@ -17,7 +17,8 @@ from twisted.internet.task import Clock
 from golem.ethereum import Client
 from golem.ethereum.contracts import TestGNT
 from golem.ethereum.node import Faucet
-from golem.ethereum.paymentprocessor import PaymentProcessor
+from golem.ethereum.paymentprocessor import \
+    PaymentProcessor, GNTToken, encode_payments
 from golem.model import Payment, PaymentStatus
 from golem.testutils import DatabaseFixture
 from golem.utils import encode_hex, decode_hex
@@ -493,7 +494,7 @@ class PaymentProcessorFunctionalTest(DatabaseFixture):
         print('gnt_addr %s', gnt_addr)
         self.state.mine()
         self.gnt = tester.ABIContract(self.state, TEST_GNT_ABI, gnt_addr)
-        PaymentProcessor.TESTGNT_ADDR = decode_hex(gnt_addr)
+        GNTToken.TESTGNT_ADDR = decode_hex(gnt_addr)
         self.privkey = tester.k1
         self.client = mock.MagicMock(spec=Client)
         self.client.get_peer_count.return_value = 0
@@ -663,28 +664,169 @@ class PaymentProcessorFunctionalTest(DatabaseFixture):
         assert self.pp._balance_value(None, now - dt) == 0
         assert self.pp._balance_value(None, now) is None
 
+
+def make_awaiting_payment():
+    p = mock.Mock()
+    p.status = PaymentStatus.awaiting
+    p.payee = urandom(20)
+    p.value = random.randint(1, 10)
+    p.subtask = '123'
+    return p
+
+
+class InteractionWithTokenTest(DatabaseFixture):
+
+    def setUp(self):
+        DatabaseFixture.setUp(self)
+        self.token = mock.Mock()
+        self.privkey = urandom(32)
+        self.client = mock.Mock()
+
+        def token_factory(client, privkey):
+            return self.token
+
+        self.pp = PaymentProcessor(self.client,
+                                   self.privkey,
+                                   token_factory=token_factory)
+
+    def test_faucet(self):
+        self.pp._PaymentProcessor__faucet = True
+
+        self.token.get_balance.return_value = 1000 * denoms.ether
+        self.assertTrue(self.pp.get_gnt_from_faucet())
+        self.token.request_from_faucet.assert_not_called()
+
+        self.token.get_balance.return_value = 0
+        self.assertFalse(self.pp.get_gnt_from_faucet())
+        self.token.request_from_faucet.assert_called_with()
+
+    def test_putting_payments(self):
+        self.client.get_balance.return_value = denoms.ether
+        self.token.get_balance.return_value = 1000 * denoms.ether
+
+        p1 = make_awaiting_payment()
+        p2 = make_awaiting_payment()
+        self.pp.add(p1)
+        self.pp.add(p2)
+        self.pp.sendout()
+        self.token.put_awaiting_payments.assert_called_with([p1, p2])
+        self.token.reset_mock()
+
+        self.pp.sendout()
+        self.token.put_awaiting_payments.assert_not_called()
+        self.token.reset_mock()
+
+    def test_taking_batch(self):
+        self.pp.deadline = time.time() - 1
+        self.token.take_next_batch.return_value = None
+        self.assertFalse(self.pp.sendout())
+
+        p1 = make_awaiting_payment()
+        p2 = make_awaiting_payment()
+        tx = mock.Mock()
+        tx_hash = '0xdead'
+        tx.hash = decode_hex(tx_hash)
+        self.client.send.return_value = tx_hash
+        self.token.take_next_batch.return_value = [p1, p2], tx
+        self.assertTrue(self.pp.sendout())
+        self.client.send.assert_called_with(tx)
+
     def test_get_incomes_from_block(self):
         block_number = 1
         receiver_address = '0xbadcode'
         some_address = '0xdeadbeef'
 
-        self.client.get_logs.return_value = []
-        assert not self.pp.get_incomes_from_block(block_number,
-                                                  receiver_address)
+        expected_incomes = [{'sender': some_address, 'value': 1}]
+        self.token.get_incomes_from_block.return_value = expected_incomes
+        incomes = self.pp.get_incomes_from_block(block_number, receiver_address)
+        self.assertEqual(expected_incomes, incomes)
 
-        topics = [self.pp.LOG_ID, None, receiver_address]
+
+class GNTTokenTest(unittest.TestCase):
+    def setUp(self):
+        self.client = mock.Mock()
+        self.privkey = urandom(32)
+        self.token = GNTToken(self.client, self.privkey)
+
+    def test_get_balance(self):
+        abi = mock.Mock()
+        self.token._GNTToken__testGNT = abi
+        encoded_data = 'dada'
+        abi.encode_function_call.return_value = encoded_data
+
+        self.client.call.return_value = None
+        self.assertEqual(None, self.token.get_balance())
+        abi.encode_function_call.assert_called_with(
+            'balanceOf',
+            [privtoaddr(self.privkey)])
+        self.client.call.assert_called_with(
+            _from=mock.ANY,
+            to='0x' + encode_hex(self.token.TESTGNT_ADDR),
+            data='0x' + encode_hex(encoded_data),
+            block='pending')
+
+        self.client.call.return_value = '0x'
+        self.assertEqual(0, self.token.get_balance())
+
+        self.client.call.return_value = '0xf'
+        self.assertEqual(15, self.token.get_balance())
+
+    def test_batches(self):
+        self.assertEqual(None, self.token.take_next_batch())
+        self.assertFalse(self.token.has_awaiting())
+
+        p1 = make_awaiting_payment()
+        self.token.put_awaiting_payments([p1])
+        p2 = make_awaiting_payment()
+        p3 = make_awaiting_payment()
+        self.token.put_awaiting_payments([p2, p3])
+
+        self.assertTrue(self.token.has_awaiting())
+
+        nonce = 1
+        self.client.get_transaction_count.return_value = nonce
+
+        abi = mock.Mock()
+        self.token._GNTToken__testGNT = abi
+        encoded_data = 'dada'
+        abi.encode_function_call.return_value = encoded_data
+
+        batch, tx = self.token.take_next_batch()
+        self.assertEqual([p1, p2, p3], batch)
+        self.assertEqual(nonce, tx.nonce)
+        self.assertEqual(self.token.TESTGNT_ADDR, tx.to)
+        self.assertEqual(0, tx.value)
+        expected_gas = PaymentProcessor.GAS_BATCH_PAYMENT_BASE + \
+            3 * PaymentProcessor.GAS_PER_PAYMENT
+        self.assertEqual(expected_gas, tx.startgas)
+        self.assertEqual(encoded_data, tx.data)
+        abi.encode_function_call.assert_called_with(
+            'batchTransfer',
+            [encode_payments([p1, p2, p3])])
+
+    def test_get_incomes_from_block(self):
+        block_number = 1
+        receiver_address = '0xbadcode'
+        some_address = '0xdeadbeef'
+
+        self.client.get_logs.return_value = None
+        incomes = self.token.get_incomes_from_block(block_number,
+                                                    receiver_address)
+        self.assertEqual(None, incomes)
+
+        topics = [self.token.TRANSFER_EVENT_ID, None, receiver_address]
         self.client.get_logs.assert_called_with(
-            address='0x' + encode_hex(self.pp.TESTGNT_ADDR),
-            from_block=block_number,
-            to_block=block_number,
-            topics=topics)
+            block_number,
+            block_number,
+            '0x' + encode_hex(self.token.TESTGNT_ADDR),
+            topics)
 
         self.client.get_logs.return_value = [{
             'topics': ['0x0', some_address, receiver_address],
             'data': '0xf',
         }]
-        incomes = self.pp.get_incomes_from_block(block_number,
-                                                 receiver_address)
-        assert len(incomes) == 1
-        assert incomes[0]['sender'] == some_address
-        assert incomes[0]['value'] == 15
+        incomes = self.token.get_incomes_from_block(block_number,
+                                                    receiver_address)
+        self.assertEqual(1, len(incomes))
+        self.assertEqual(some_address, incomes[0]['sender'])
+        self.assertEqual(15, incomes[0]['value'])
