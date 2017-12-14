@@ -18,6 +18,7 @@ from golem.ethereum import Client
 from golem.model import db, Payment, PaymentStatus
 from golem.utils import decode_hex, encode_hex
 from .contracts import TestGNT
+from .contracts import gntw
 from .node import tETH_faucet_donate
 
 log = logging.getLogger("golem.pay")
@@ -76,11 +77,12 @@ class AbstractToken(object, metaclass=abc.ABCMeta):
         self._client.send(tx)
         return tx
 
-    def _get_balance(self, abi, token_address) -> int:
-        addr = keys.privtoaddr(self._privkey)
-        data = abi.encode_function_call('balanceOf', [addr])
+    def _get_balance(self, abi, token_address, account_address=None) -> int:
+        if not account_address:
+            account_address = keys.privtoaddr(self._privkey)
+        data = abi.encode_function_call('balanceOf', [account_address])
         r = self._client.call(
-            _from='0x' + encode_hex(addr),
+            _from='0x' + encode_hex(account_address),
             to='0x' + encode_hex(token_address),
             data='0x' + encode_hex(data),
             block='pending')
@@ -174,6 +176,171 @@ class GNTToken(AbstractToken):
                 'value': int(entry['data'], 16),
             })
         return res
+
+
+class GNTWToken(AbstractToken):
+    """
+    When batchTransfer function is in a different contract than the main token.
+    GNTW implementation specifically.
+    """
+    GNTW_ADDRESS = decode_hex("a8CD649dB30b963592D88FdE95fe6284d6224329")
+    TESTGNT_ADDRESS = decode_hex("2928aA793B79FCdb7b5B94f5d8419e0EE20AbDaF")
+    FAUCET_ADDRESS = decode_hex("36FeE1616A131E7382922475A1BA67F88F891f0d")
+
+    # keccak256(BatchTransfer(address,address,uint256,uint64))
+    TRANSFER_EVENT_ID = '0x24310ec9df46c171fe9c6d6fe25cac6781e7fa8f153f8f72ce63037a4b38c4b6'  # noqa
+
+    CREATE_PERSONAL_DEPOSIT_GAS = 320000
+    PROCESS_DEPOSIT_GAS = 110000
+    GNT_TRANSFER_GAS = 55000
+
+    def __init__(self, client: Client, privkey: bytes):
+        super().__init__(client, privkey)
+        self.__gntw = abi.ContractTranslator(
+            json.loads(gntw.GolemNetworkTokenWrapped.ABI))
+        self.__gnt = abi.ContractTranslator(
+            json.loads(gntw.GolemNetworkToken.ABI))
+        self.__faucet = abi.ContractTranslator(json.loads(gntw.Faucet.ABI))
+        self.__deposit_address = None
+        self.__deposit_address_created = False
+        self.__awaiting = []
+        self.__process_deposit_tx = None
+
+    def get_balance(self) -> int:
+        gnt_balance = self._get_balance(self.__gnt, self.TESTGNT_ADDRESS)
+        if gnt_balance is None:
+            return None
+        gntw_balance = self._get_balance(self.__gntw, self.GNTW_ADDRESS)
+        if gntw_balance is None:
+            return None
+
+        pda = self.__get_deposit_address()
+        deposit_balance = 0
+        if pda:
+            deposit_balance = self._get_balance(self.__gnt,
+                                                self.TESTGNT_ADDRESS,
+                                                pda)
+            if deposit_balance is None:
+                return None
+
+        log.info("TestGNT: {} GNTW: {} Deposit: {}".format(
+            gnt_balance / denoms.ether,
+            gntw_balance / denoms.ether,
+            deposit_balance / denoms.ether))
+        return gnt_balance + gntw_balance + deposit_balance
+
+    def request_from_faucet(self) -> None:
+        self._request_from_faucet(self.__faucet, self.FAUCET_ADDRESS)
+
+    def put_awaiting_payments(self, batch: List[Payment]) -> None:
+        self.__awaiting.extend(batch)
+
+    def has_awaiting(self) -> bool:
+        return bool(self.__awaiting)
+
+    def take_next_batch(self) -> (List[Payment], Transaction):
+        if not self.__awaiting:
+            return None
+
+        if self.__process_deposit_tx:
+            hstr = '0x' + encode_hex(self.__process_deposit_tx)
+            receipt = self._client.get_transaction_receipt(hstr)
+            if not receipt:
+                log.info("Waiting to process deposit")
+                return None
+            self.__process_deposit_tx = None
+
+        gntw_balance = self._get_balance(self.__gntw, self.GNTW_ADDRESS)
+        if gntw_balance is None:
+            return None
+        total_value = sum([p.value for p in self.__awaiting])
+        if gntw_balance < total_value:
+            log.info("Not enough GNTW, trying to convert GNT. "
+                     "GNTW: {}, total_value: {}"
+                     .format(gntw_balance, total_value))
+            self.__convert_gnt()
+            return None
+
+        payments = self.__awaiting
+        self.__awaiting = []
+
+        p = encode_payments(payments)
+        closure_time = int(time.time())
+        data = self.__gntw.encode_function_call('batchTransfer',
+                                                (p, closure_time))
+        gas = PaymentProcessor.GAS_BATCH_PAYMENT_BASE + \
+            len(p) * PaymentProcessor.GAS_PER_PAYMENT
+        tx = self._create_transaction(self.GNTW_ADDRESS, data, gas)
+        return payments, tx
+
+    def get_incomes_from_block(self, block: int, address) -> List[Any]:
+        logs = self._client.get_logs(block,
+                                     block,
+                                     '0x' + encode_hex(self.GNTW_ADDRESS),
+                                     [self.TRANSFER_EVENT_ID, None, address])
+        if not logs:
+            return logs
+
+        res = []
+        for entry in logs:
+            if entry['topics'][2] != address:
+                raise Exception("Unexpected income event from {}"
+                                .format(entry['topics'][2]))
+
+            res.append({
+                'sender': entry['topics'][1],
+                'value': int(entry['data'][:66], 16),
+            })
+        return res
+
+    def __get_deposit_address(self) -> bytes:
+        if not self.__deposit_address:
+            addr = keys.privtoaddr(self._privkey)
+            data = self.__gntw.encode('getPersonalDepositAddress', (addr,))
+            res = self._client.call(_from='0x' + encode_hex(addr),
+                                    to='0x' + encode_hex(self.GNTW_ADDRESS),
+                                    data='0x' + encode_hex(data),
+                                    block='pending')
+            if int(res, 16) != 0:
+                self.__deposit_address = decode_hex(res)[-20:]
+            elif not self.__deposit_address_created:
+                data = self.__gntw.encode_function_call(
+                    'createPersonalDepositAddress', ())
+                tx = self._send_transaction(self.GNTW_ADDRESS,
+                                            data,
+                                            self.CREATE_PERSONAL_DEPOSIT_GAS)
+                log.info("Create personal deposit address tx: {}"
+                         .format(encode_hex(tx.hash)))
+                self.__deposit_address_created = True
+
+        return self.__deposit_address
+
+    def __convert_gnt(self) -> None:
+        gnt_balance = self._get_balance(self.__gnt, self.TESTGNT_ADDRESS)
+        if gnt_balance is None:
+            return
+
+        log.info("Converting {} GNT to GNTW".format(gnt_balance))
+        pda = self.__get_deposit_address()
+        if not pda:
+            log.info("Not converting until deposit address is known")
+            return
+
+        data = self.__gnt.encode_function_call(
+            'transfer',
+            [self.__deposit_address, gnt_balance])
+        tx = self._send_transaction(self.TESTGNT_ADDRESS,
+                                    data,
+                                    self.GNT_TRANSFER_GAS)
+        log.info("Transfer GNT to personal deposit tx: {}"
+                 .format(encode_hex(tx.hash)))
+
+        data = self.__gntw.encode_function_call('processDeposit', [])
+        tx = self._send_transaction(self.GNTW_ADDRESS,
+                                    data,
+                                    self.PROCESS_DEPOSIT_GAS)
+        self.__process_deposit_tx = tx.hash
+        log.info("Process deposit tx: {}".format(encode_hex(tx.hash)))
 
 
 class PaymentProcessor(LoopingCallService):
